@@ -342,7 +342,7 @@ while True:
             dist_ball_px = np.linalg.norm(
                 np.array(ball_pos) - np.array(prev_ball_pos))
             dist_ball_m = dist_ball_px / PIXELS_PER_METER
-            if dist_ball_m <= MAX_DIST_PER_FRAME_M and dist_ball_m > 0:
+            if dist_ball_m > 0:
                 ball_speed = dist_ball_m / frame_time
             else:
                 ball_speed = 0.0
