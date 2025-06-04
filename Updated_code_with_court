@@ -1,0 +1,1198 @@
+import cv2
+from ultralytics import YOLO
+import supervision as sv
+from collections import deque
+import numpy as np
+import torch
+import time
+import json
+from datetime import datetime, timedelta
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Tuple, Optional
+from inference.models.utils import get_model
+
+# === Load Models ===
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"Using device: {device}")
+
+# Load ball detection model
+ball_model = get_model(
+    model_id="squash_ball_detection-r1tts/1",
+    api_key="QJen0rGApuNHlCEwrqfj"
+)
+
+# Load court detection model
+court_model = get_model(
+    model_id="squash_court/2",
+    api_key="QJen0rGApuNHlCEwrqfj"
+)
+player_model = YOLO("yolov8s.pt")
+pose_model = YOLO("yolov8x-pose.pt")
+player_model.to(device)
+pose_model.to(device)
+
+# === Video Setup ===
+input_video = "/Users/zsakr/Desktop/test2.mov"
+output_video = "heatmap_output.mp4"
+
+# Initialize video capture
+cap = cv2.VideoCapture(input_video)
+if not cap.isOpened():
+    print("Error opening video file")
+    exit(1)
+
+# Get video properties
+frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+fps = cap.get(cv2.CAP_PROP_FPS)
+frame_time = 1.0 / fps
+
+out = cv2.VideoWriter(
+    output_video,
+    cv2.VideoWriter_fourcc(*'mp4v'),
+    fps,
+    (frame_width, frame_height)
+)
+
+# === Scale: pixels → meters ===
+# Standard squash court dimensions (in meters)
+COURT_WIDTH_M = 6.4
+COURT_LENGTH_M = 9.75
+
+# Initialize pixels per meter (will be updated based on court detection)
+PIXELS_PER_METER = 100  # Approximate conversion factor
+
+# Constants
+HEATMAP_WIDTH = 640
+HEATMAP_HEIGHT = 480
+BUFFER_SIZE = 3  # frames for position smoothing
+MIN_MOVEMENT_THRESHOLD = 0.05  # 5cm minimum movement per frame to filter noise
+MAX_MOVEMENT_THRESHOLD = 1.0  # 1m maximum movement per frame
+CONTACT_COOLDOWN = 10  # frames between contact detections
+BOUNCE_THRESHOLD = 5  # minimum vertical velocity change for bounce detection
+MIN_RALLY_SHOTS = 3  # minimum shots to consider a valid rally
+
+@dataclass
+class ShotEvent:
+    frame_number: int
+    timestamp: float
+    ball_position: tuple
+    shot_type: str
+    wall_contacted: str
+    bounce_count: int
+    player_position: Optional[tuple]
+    player_id: Optional[int]
+    bounce_frame: Optional[int] = None
+    is_serve: bool = False
+    player_color: Optional[str] = None
+
+@dataclass
+class RallyEvent:
+    start_frame: int
+    end_frame: Optional[int]
+    start_time: float
+    end_time: Optional[float]
+    shots: List[ShotEvent]
+    winner_id: Optional[int]
+    end_reason: Optional[str]
+
+# Shot type definitions
+SHOT_TYPES = {
+    'straight_drive': {
+        'walls': ['front-wall-up'],
+        'height_ratio': 0.3,
+        'speed': 'fast',
+        'direction': 'straight'
+    },
+    'cross_court_drive': {
+        'walls': ['front-wall-up'],
+        'height_ratio': 0.3,
+        'speed': 'fast',
+        'direction': 'cross'
+    },
+    'straight_lob': {
+        'walls': ['front-wall-up'],
+        'height_ratio': 0.8,
+        'speed': 'slow',
+        'direction': 'straight'
+    },
+    'cross_court_lob': {
+        'walls': ['front-wall-up'],
+        'height_ratio': 0.8,
+        'speed': 'slow',
+        'direction': 'cross'
+    },
+    'three_wall_boast': {
+        'walls': ['side-wall', 'front-wall-up', 'side-wall'],
+        'height_ratio': 0.5,
+        'speed': 'medium'
+    },
+    'two_wall_boast': {
+        'walls': ['side-wall', 'front-wall-up'],
+        'height_ratio': 0.5,
+        'speed': 'medium'
+    },
+    'volley_straight': {
+        'height_ratio': 0.6,
+        'speed': 'fast',
+        'direction': 'straight',
+        'is_volley': True
+    },
+    'volley_cross': {
+        'height_ratio': 0.6,
+        'speed': 'fast',
+        'direction': 'cross',
+        'is_volley': True
+    },
+    'volley_drop': {
+        'height_ratio': 0.3,
+        'speed': 'slow',
+        'walls': ['front-wall-up'],
+        'is_volley': True
+    },
+    'volley_boast': {
+        'walls': ['side-wall', 'front-wall-up'],
+        'height_ratio': 0.5,
+        'is_volley': True
+    },
+    'straight_drop': {
+        'height_ratio': 0.2,
+        'speed': 'slow',
+        'walls': ['front-wall-up'],
+        'direction': 'straight'
+    },
+    'cross_court_drop': {
+        'height_ratio': 0.2,
+        'speed': 'slow',
+        'walls': ['front-wall-up'],
+        'direction': 'cross'
+    },
+    'serve': {
+        'height_ratio': 0.6,
+        'walls': ['front-wall-up'],
+        'direction': 'straight'
+    }
+}
+
+# Initialize tracking variables
+frame_count = 0
+prev_ball_pos = None
+ball_history = []
+player_history = []
+wall_contact_history = {}
+wall_contact_cooldown = {}
+rally_history = []
+current_rally = None
+current_shot = None
+bounce_count = 0
+last_bounce_frame = None
+start_time = datetime.now()
+
+# Player color tracking
+player_colors = {}
+
+# HSV color ranges for common shirt colors
+COLOR_RANGES = {
+    'red': [
+        {'lower': np.array([0, 70, 50]), 'upper': np.array([10, 255, 255])},
+        {'lower': np.array([160, 70, 50]), 'upper': np.array([180, 255, 255])}
+    ],
+    'blue': [{'lower': np.array([100, 70, 50]), 'upper': np.array([130, 255, 255])}],
+    'green': [{'lower': np.array([40, 70, 50]), 'upper': np.array([80, 255, 255])}],
+    'white': [{'lower': np.array([0, 0, 180]), 'upper': np.array([180, 30, 255])}],
+    'black': [{'lower': np.array([0, 0, 0]), 'upper': np.array([180, 255, 70])}],
+    'yellow': [{'lower': np.array([20, 70, 50]), 'upper': np.array([30, 255, 255])}],
+    'gray': [{'lower': np.array([0, 0, 70]), 'upper': np.array([180, 30, 180])}]
+}
+
+def draw_court_area(frame, x1, y1, x2, y2, label, conf, color):
+    # Create semi-transparent colored overlay for the area
+    overlay = frame.copy()
+    alpha = 0.3  # Transparency factor
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), color, -1)
+    cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+    
+    # Add label with confidence
+    text = f"{label} {conf}%"
+    font_scale = 0.8
+    thickness = 2
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    
+    # Get text size
+    text_size = cv2.getTextSize(text, font, font_scale, thickness)[0]
+    
+    # Calculate text position - center of the area
+    text_x = x1 + (x2 - x1 - text_size[0]) // 2
+    text_y = y1 + (y2 - y1 + text_size[1]) // 2
+    
+    # Draw colored background for text
+    padding = 10
+    bg_x1 = text_x - padding
+    bg_y1 = text_y - text_size[1] - padding
+    bg_x2 = text_x + text_size[0] + padding
+    bg_y2 = text_y + padding
+    
+    # Draw semi-transparent background
+    bg_overlay = frame.copy()
+    cv2.rectangle(bg_overlay, (bg_x1, bg_y1), (bg_x2, bg_y2), color, -1)
+    cv2.addWeighted(bg_overlay, 0.7, frame, 0.3, 0, frame)
+    
+    # Draw white text
+    cv2.putText(frame, text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness)
+
+def create_mask_from_points(points, shape):
+    # Convert points to numpy arrays for polygon
+    points_array = np.array([(p.x, p.y) for p in points], dtype=np.int32)
+    # Create empty mask
+    mask = np.zeros(shape[:2], dtype=np.uint8)
+    # Fill polygon with ones
+    cv2.fillPoly(mask, [points_array], 1)
+    return mask
+
+def detect_bounce(ball_history, frame_idx, min_points=5):
+    if len(ball_history) < min_points:
+        return False
+        
+    # Look at recent vertical velocities
+    recent_vy = [p[3][1] for p in ball_history[-min_points:]]
+    # Bounce is detected when velocity changes from negative to positive
+    for i in range(1, len(recent_vy)):
+        if recent_vy[i-1] < 0 and recent_vy[i] > 0:
+            return True
+    return False
+
+def detect_shirt_color(frame, box):
+    x1, y1, x2, y2 = map(int, box)
+    
+    # Extract upper body region (top 1/2 of bounding box)
+    body_height = (y2 - y1) // 2
+    body_region = frame[y1:y1+body_height, x1:x2]
+    
+    if body_region.size == 0:
+        return None
+    
+    # Convert to HSV
+    hsv = cv2.cvtColor(body_region, cv2.COLOR_BGR2HSV)
+    
+    # Check each color range
+    max_pixels = 0
+    dominant_color = None
+    
+    for color, ranges in COLOR_RANGES.items():
+        total_pixels = 0
+        for r in ranges:
+            mask = cv2.inRange(hsv, r['lower'], r['upper'])
+            pixels = cv2.countNonZero(mask)
+            total_pixels += pixels
+            
+        if total_pixels > max_pixels:
+            max_pixels = total_pixels
+            dominant_color = color
+    
+    # Require minimum number of pixels to confirm color
+    min_pixels = (x2 - x1) * body_height * 0.1  # 10% of upper body area
+    return dominant_color if max_pixels > min_pixels else None
+
+def get_closest_player(frame, ball_pos, player_boxes, player_ids, frame_width):
+    closest_dist = float('inf')
+    closest_player = None
+    closest_pos = None
+    closest_color = None
+    
+    for i, box in enumerate(player_boxes):
+        if i >= len(player_ids):  # Skip if no ID available
+            continue
+            
+        pid = player_ids[i]
+        
+        # Use center bottom of box as player position
+        x1, y1, x2, y2 = box.astype(int)
+        player_pos = ((x1 + x2) // 2, y2)
+        
+        # Calculate distance to ball
+        dist = np.sqrt((player_pos[0] - ball_pos[0])**2 + (player_pos[1] - ball_pos[1])**2)
+        
+        if dist < closest_dist:
+            # Always try to detect shirt color
+            color = detect_shirt_color(frame, box)
+            if color:
+                player_colors[pid] = color
+            
+            closest_dist = dist
+            closest_player = pid
+            closest_pos = player_pos
+            closest_color = player_colors.get(pid)
+    
+    # Only return if player is within reasonable distance (e.g., 1/4 of court width)
+    if closest_dist < frame_width / 4:
+        return closest_player, closest_pos, closest_color
+    return None, None, None
+
+def classify_shot(ball_history, wall_contacts, frame_height, frame_width, is_first_shot=False):
+    if len(ball_history) < 3:
+        return 'unknown'
+        
+    # Get trajectory characteristics
+    start_pos = ball_history[0][2]
+    end_pos = ball_history[-1][2]
+    
+    # Calculate height ratio (max height / frame height)
+    max_height = min(p[2][1] for p in ball_history)
+    height_ratio = max_height / frame_height
+    
+    # Calculate speed from start to end
+    dx = end_pos[0] - start_pos[0]
+    dy = end_pos[1] - start_pos[1]
+    speed = np.sqrt(dx*dx + dy*dy) / (len(ball_history) * frame_time)
+    speed_type = 'fast' if speed > 10 else ('medium' if speed > 5 else 'slow')
+    
+    # Determine if it's a volley based on bounce frame
+    is_volley = False
+    if current_shot and current_shot.bounce_frame:
+        is_volley = ball_history[-1][0] < current_shot.bounce_frame
+    
+    # Determine direction (straight or cross)
+    court_middle = frame_width / 2
+    start_side = 'left' if start_pos[0] < court_middle else 'right'
+    end_side = 'left' if end_pos[0] < court_middle else 'right'
+    direction = 'straight' if start_side == end_side else 'cross'
+    
+    # Check for serve
+    if is_first_shot and height_ratio > 0.5:
+        return 'serve'
+    
+    # Score-based classification
+    best_score = 0
+    best_shot_type = 'unknown'
+    
+    for shot_type, criteria in SHOT_TYPES.items():
+        if shot_type == 'serve':  # Skip serve type in normal classification
+            continue
+            
+        score = 0
+        
+        # Score wall contacts (+1)
+        if 'walls' in criteria:
+            if all(wall in wall_contacts for wall in criteria['walls']):
+                score += 1
+        
+        # Score height ratio (+1)
+        if 'height_ratio' in criteria:
+            if abs(height_ratio - criteria['height_ratio']) <= 0.3:
+                score += 1
+        
+        # Score speed (+1)
+        if 'speed' in criteria:
+            if ((criteria['speed'] == 'fast' and speed_type == 'fast') or
+                (criteria['speed'] == 'medium' and speed_type == 'medium') or
+                (criteria['speed'] == 'slow' and speed_type == 'slow')):
+                score += 1
+        
+        # Score direction (+1)
+        if 'direction' in criteria:
+            if criteria['direction'] == direction:
+                score += 1
+        
+        # Score volley status (+1)
+        if 'is_volley' in criteria:
+            if criteria['is_volley'] == is_volley:
+                score += 1
+        
+        if score > best_score:
+            best_score = score
+            best_shot_type = shot_type
+    
+    return best_shot_type
+
+def check_ball_wall_contact(ball_pos, wall_mask, wall_name, frame_count, frame):
+    global wall_contact_history, wall_contact_cooldown, current_shot, current_rally
+    
+    # Check if we're still in cooldown for this wall
+    if wall_name in wall_contact_cooldown and frame_count - wall_contact_cooldown[wall_name] < CONTACT_COOLDOWN:
+        return False
+    
+    # Check if ball position intersects with wall mask
+    x, y = map(int, ball_pos)
+    if 0 <= y < wall_mask.shape[0] and 0 <= x < wall_mask.shape[1]:
+        if wall_mask[y, x] > 0:
+            # Record contact
+            wall_contact_history[wall_name] = ball_pos
+            wall_contact_cooldown[wall_name] = frame_count
+            
+            # Create new shot event if in a rally
+            if current_rally is not None:
+                # Find closest player in last few frames
+                closest_player_id = None
+                closest_player_pos = None
+                closest_player_color = None
+                for i in range(max(0, len(player_history)-5), len(player_history)):
+                    player_id, player_pos, player_color = get_closest_player(
+                        frame,
+                        ball_pos,
+                        player_history[i]['boxes'],
+                        player_history[i]['ids'],
+                        frame_width
+                    )
+                    if player_id is not None:
+                        closest_player_id = player_id
+                        closest_player_pos = player_pos
+                        closest_player_color = player_color
+                        break
+                
+                # Classify shot
+                is_first_shot = len(current_rally.shots) == 0
+                shot_type = classify_shot(ball_history, 
+                                        list(wall_contact_history.keys()), 
+                                        frame_height,
+                                        frame_width,
+                                        is_first_shot)
+                
+                current_shot = ShotEvent(
+                    frame_number=frame_count,
+                    timestamp=(datetime.now() - start_time).total_seconds(),
+                    ball_position=ball_pos,
+                    shot_type=shot_type,
+                    wall_contacted=wall_name,
+                    bounce_count=bounce_count,
+                    player_position=closest_player_pos,
+                    player_id=closest_player_id,
+                    bounce_frame=last_bounce_frame if last_bounce_frame else None,
+                    is_serve=is_first_shot and shot_type == 'serve',
+                    player_color=closest_player_color
+                )
+                current_rally.shots.append(current_shot)
+            
+            return True
+    return False
+
+def update_rally_state(frame_count, ball_pos=None, bounce_detected=False, tin_hit=False):
+    global current_rally, bounce_count, rally_history
+    
+    # Start new rally if none exists
+    if current_rally is None:
+        elapsed_time = (datetime.now() - start_time).total_seconds()
+        current_rally = RallyEvent(
+            start_frame=frame_count,
+            start_time=elapsed_time,
+            end_frame=None,
+            end_time=None,
+            shots=[],
+            winner_id=None,
+            end_reason=None
+        )
+        bounce_count = 0
+        return
+    
+    # Update bounce count
+    if bounce_detected:
+        bounce_count += 1
+        
+    # Check rally end conditions
+    rally_ended = False
+    end_reason = None
+    
+    if bounce_count >= 2:
+        rally_ended = True
+        end_reason = 'double_bounce'
+    elif tin_hit:
+        rally_ended = True
+        end_reason = 'tin'
+    
+    # Handle rally end
+    if rally_ended and current_rally is not None:
+        current_rally.end_frame = frame_count
+        current_rally.end_time = (datetime.now() - start_time).total_seconds()
+        current_rally.end_reason = end_reason
+        
+        # Only save rallies with enough shots
+        if len(current_rally.shots) >= MIN_RALLY_SHOTS:
+            rally_history.append(current_rally)
+        
+        # Reset for next rally
+        current_rally = None
+        bounce_count = 0
+
+def draw_wall_contact(frame, contact_pos, wall_name):
+    # Draw a ripple effect at contact point
+    x, y = map(int, contact_pos)
+    
+    # Define ripple colors for different walls
+    colors = {
+        'front-wall-up': (255, 0, 255),    # Magenta
+        'front-wall-down': (0, 255, 255),   # Cyan
+        'left-wall': (255, 0, 0),           # Blue
+        'right-wall': (0, 0, 255),          # Red
+        'tin': (128, 128, 0),               # Dark Yellow
+    }
+    color = colors.get(wall_name, (0, 255, 0))
+    
+    # Draw ripple circles
+    for radius in range(5, 25, 5):
+        cv2.circle(frame, (x, y), radius, color, 2)
+    
+    # Add text label
+    cv2.putText(frame, f"Contact: {wall_name}", (x + 10, y - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+
+def update_pixels_per_meter(frame, annotated_frame=None):
+    global PIXELS_PER_METER
+    # Detect court in the frame
+    print("\nStarting court detection...")
+    court_results = court_model.infer(frame)[0]
+    
+    # Debug court detection results
+    print("\nCourt detection results:")
+    print(f"Frame shape: {frame.shape}")
+    print(f"Available attributes: {dir(court_results)}")
+    
+    if not hasattr(court_results, 'predictions'):
+        print("ERROR: No 'predictions' attribute in court_results")
+        return False
+        
+    if len(court_results.predictions) == 0:
+        print("ERROR: No predictions found in court_results")
+        return False
+        
+    print(f"\nNumber of predictions: {len(court_results.predictions)}")
+    print(f"First prediction attributes: {dir(court_results.predictions[0])}")
+    print(f"First prediction details:")
+    pred = court_results.predictions[0]
+    print(f"  class_name: {pred.class_name}")
+    print(f"  confidence: {pred.confidence}")
+    print(f"  x,y: {pred.x}, {pred.y}")
+    print(f"  width,height: {pred.width}, {pred.height}")
+    print(f"  num points: {len(pred.points)}")
+    
+    # Try to get predictions
+    if hasattr(court_results, 'predictions') and len(court_results.predictions) > 0:
+        # Get overall court dimensions from the 'floor' segment
+        floor_pred = None
+        for pred in court_results.predictions:
+            if pred.class_name == 'floor':
+                floor_pred = pred
+                break
+        
+        # Print all predictions for debugging
+        print("Found predictions:")
+        for pred in court_results.predictions:
+            print(f"- {pred.class_name}: {pred.confidence}")
+        
+        if floor_pred is not None:
+            # Create mask from points
+            floor_mask = create_mask_from_points(floor_pred.points, frame.shape)
+            # Get court dimensions from floor mask
+            x_coords = np.where(np.any(floor_mask, axis=0))[0]
+            y_coords = np.where(np.any(floor_mask, axis=1))[0]
+            if len(x_coords) > 0 and len(y_coords) > 0:
+                court_width_px = x_coords[-1] - x_coords[0]
+                court_height_px = y_coords[-1] - y_coords[0]
+                
+                # Calculate pixels per meter
+                pixels_per_meter_width = court_width_px / COURT_WIDTH_M
+                pixels_per_meter_length = court_height_px / COURT_LENGTH_M
+                PIXELS_PER_METER = (pixels_per_meter_width + pixels_per_meter_length) / 2
+                
+                # Draw court areas if annotated_frame is provided
+                if annotated_frame is not None:
+                    # Define colors for different areas
+                    colors = {
+                        'front-wall-up': (255, 0, 255),    # Magenta
+                        'front-wall-down': (0, 255, 255),   # Cyan
+                        'left-wall': (255, 0, 0),           # Blue
+                        'right-wall': (0, 0, 255),          # Red
+                        'floor': (255, 255, 0),             # Yellow
+                        'tin': (128, 128, 0),               # Dark Yellow
+                        'left-square': (255, 128, 0),       # Orange
+                        'right-square': (0, 255, 255)       # Light Blue
+                    }
+                    
+                    # Draw each court area
+                    for pred in court_results.predictions:
+                        print(f"\nDrawing area for {pred.class_name}:")
+                        try:
+                            # Create mask from points
+                            print(f"  Creating mask from {len(pred.points)} points")
+                            mask = create_mask_from_points(pred.points, frame.shape)
+                            print("  Mask created successfully")
+                            
+                            # Get bounding box for this area
+                            x_coords = np.where(np.any(mask, axis=0))[0]
+                            y_coords = np.where(np.any(mask, axis=1))[0]
+                            print(f"  Found coordinates: x={len(x_coords)}, y={len(y_coords)}")
+                            
+                            if len(x_coords) > 0 and len(y_coords) > 0:
+                                x1, x2 = x_coords[0], x_coords[-1]
+                                y1, y2 = y_coords[0], y_coords[-1]
+                                print(f"  Drawing area at: ({x1},{y1}) to ({x2},{y2})")
+                                color = colors.get(pred.class_name, (0, 255, 0))
+                                draw_court_area(annotated_frame, x1, y1, x2, y2, 
+                                               pred.class_name, int(pred.confidence * 100), color)
+                                print("  Area drawn successfully")
+                            else:
+                                print("  ERROR: No valid coordinates found in mask")
+                        except Exception as e:
+                            print(f"  ERROR drawing area: {str(e)}")
+                return True
+    return False
+
+# === Annotators & Visuals ===
+box_annotator = sv.BoxAnnotator()
+label_annotator = sv.LabelAnnotator()
+trail = deque(maxlen=5)
+palette = sv.ColorPalette.DEFAULT
+
+# === Heatmap Accumulators ===
+heatmap_accum_1 = np.zeros((frame_height, frame_width), dtype=np.float32)
+heatmap_accum_2 = np.zeros((frame_height, frame_width), dtype=np.float32)
+
+# === For speed and distance calculation ===
+prev_positions = {}      # Holds previous ankle positions per player ID
+prev_positions_buffer = {}  # Holds last N positions for smoothing
+
+# Holds total ankle‐based distances (in meters) per player ID
+total_distances = {}
+prev_ball_pos = None     # Separate storage for ball's last‐seen position
+
+# For "one" mode: store shirt histogram of the target
+target_shirt_hist = None
+
+# --- Ask user whether to track one or both players ---
+track_mode = input("Track one or both players? (one/both): ").strip().lower()
+if track_mode == "one":
+    target_player_id = int(
+        input("Which player do you want to track? (tracker_id): "))
+    print("Processing video with heatmap and metrics for player ID:", target_player_id)
+elif track_mode == "both":
+    print("Processing video with heatmaps and metrics for both top players.")
+else:
+    raise ValueError("Invalid input. Please enter 'one' or 'both'.")
+
+frame_index = 0
+
+
+def compute_iou(boxA, boxB):
+    """
+    Compute IoU between boxA and boxB.
+    boxA, boxB: [x1, y1, x2, y2]
+    """
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+    interW = max(0, xB - xA)
+    interH = max(0, yB - yA)
+    interArea = interW * interH
+    if interArea == 0:
+        return 0.0
+    boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+    boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+    return interArea / float(boxAArea + boxBArea - interArea)
+
+
+def get_shirt_hist(frame, box):
+    """
+    Compute a normalized Hue histogram for the upper-third ("shirt") region of a bounding box.
+    box: [x1, y1, x2, y2], frame in BGR.
+    """
+    x1, y1, x2, y2 = box.astype(int)
+    h = y2 - y1
+    # Define shirt region as top third of the bounding box
+    shirt_y2 = y1 + h // 3
+    shirt_region = frame[y1:shirt_y2, x1:x2]
+    if shirt_region.size == 0:
+        return None
+    hsv = cv2.cvtColor(shirt_region, cv2.COLOR_BGR2HSV)
+    # Compute 1D Hue histogram with 50 bins, range [0,180]
+    hist = cv2.calcHist([hsv], [0], None, [50], [0, 180])
+    cv2.normalize(hist, hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+    return hist
+
+
+# Initialize pixels per meter with first frame
+ret, first_frame = cap.read()
+if not ret:
+    raise IOError("Could not read first frame")
+
+print("\nProcessing first frame:")
+print("First frame shape:", first_frame.shape)
+rgb_first_frame = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
+
+# Save first frame for debugging
+cv2.imwrite('first_frame.jpg', first_frame)
+print("Saved first frame as 'first_frame.jpg'")
+
+# Save RGB frame for debugging
+cv2.imwrite('first_frame_rgb.jpg', cv2.cvtColor(rgb_first_frame, cv2.COLOR_RGB2BGR))
+print("Saved RGB first frame as 'first_frame_rgb.jpg'")
+
+first_frame_annotated = first_frame.copy()
+print("\nAttempting court detection...")
+if not update_pixels_per_meter(rgb_first_frame, first_frame_annotated):
+    raise IOError("Could not detect court in first frame")
+
+# Save annotated frame for debugging
+cv2.imwrite('first_frame_annotated.jpg', first_frame_annotated)
+print("Saved annotated frame as 'first_frame_annotated.jpg'")
+
+print(f"Initialized with {PIXELS_PER_METER:.2f} pixels per meter")
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    annotated_frame = frame.copy()
+    
+    # Detect court and get wall masks
+    court_results = court_model.infer(rgb_frame)[0]
+    wall_masks = {}
+    
+    if hasattr(court_results, 'predictions') and len(court_results.predictions) > 0:
+        for pred in court_results.predictions:
+            if pred.class_name in ['front-wall-up', 'front-wall-down', 'left-wall', 'right-wall', 'tin']:
+                wall_masks[pred.class_name] = create_mask_from_points(pred.points, rgb_frame.shape)
+    
+    # Update court dimensions and visualization periodically
+    if frame_index % 30 == 0:
+        # Update court visualization
+        if not update_pixels_per_meter(rgb_frame, annotated_frame):
+            print("Warning: Could not detect court in frame")
+
+    # --- Ball Detection ---
+    ball_results = ball_model.infer(rgb_frame)[0]
+    ball_detections = sv.Detections.from_inference(ball_results)
+
+    # --- Player Detection with tracking ---
+    results = player_model.track(
+        frame, persist=True, classes=[0], verbose=False, device=device
+    )
+    player_detections = sv.Detections.from_ultralytics(results[0])
+    player_boxes = player_detections.xyxy.copy()  # shape: (N_players, 4)
+    player_ids = player_detections.tracker_id if player_detections.tracker_id is not None else []
+
+    # --- Pose Estimation (YoloV8x‐Pose) ---
+    pose_results = pose_model(frame)[0]
+    if hasattr(pose_results, "boxes") and pose_results.boxes is not None:
+        pose_boxes = pose_results.boxes.xyxy.cpu().numpy()    # (N_pose, 4)
+        pose_kps = pose_results.keypoints.data.cpu().numpy()  # (N_pose, 17, 3)
+    else:
+        pose_boxes = np.zeros((0, 4))
+        pose_kps = np.zeros((0, 17, 3))
+
+    # If more than two players detected, keep top2 by confidence (for "both" mode)
+    if len(player_boxes) > 2:
+        top2 = np.argsort(player_detections.confidence)[-2:][::-1]
+        player_boxes = player_boxes[top2]
+        player_detections.xyxy = player_boxes
+        player_detections.confidence = player_detections.confidence[top2]
+        player_detections.class_id = player_detections.class_id[top2]
+        if player_ids is not None:
+            player_ids = [player_ids[i] for i in top2]
+
+    # --- Shadow Rendering under players ---
+    annotated_frame = frame.copy()
+    overlay = frame.copy()
+    for box in player_boxes:
+        x1, y1, x2, y2 = box.astype(int)
+        center_x = (x1 + x2) // 2
+        center_y = y2 + 10
+        width = int((x2 - x1) * 0.8)
+        height = int((x2 - x1) * 0.25)
+
+        y1_clip = np.clip(y1, 0, frame.shape[0])
+        y2_clip = np.clip(y1 + (y2 - y1) // 4, 0, frame.shape[0])
+        shirt_region = frame[y1_clip:y2_clip, x1:x2]
+
+        if shirt_region.size == 0:
+            shadow_color = (30, 30, 30)
+        else:
+            avg_color = shirt_region.mean(axis=(0, 1)).astype(int)
+            b, g, r = avg_color
+            factor = 1.3
+            shadow_color = tuple(int(c) for c in np.clip(
+                [b * factor, g * factor, r * factor], 0, 255))
+
+        cv2.ellipse(overlay, (center_x, center_y),
+                    (width // 2, height), 0, 0, 360, shadow_color, -1)
+
+    cv2.addWeighted(overlay, 0.7, annotated_frame, 0.3, 0, annotated_frame)
+
+    # --- Ball Trail ---
+    if len(ball_detections.xyxy) > 0:
+        x1, y1, x2, y2 = ball_detections.xyxy[0]
+        cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
+        trail.append((cx, cy))
+
+    for i in range(1, len(trail)):
+        if trail[i - 1] and trail[i]:
+            thickness = int(8 * (1 - i / len(trail))) + 1
+            color = (0, 255 - i * 7, 255)
+            cv2.line(annotated_frame, trail[i - 1], trail[i], color, thickness)
+
+    # === Process Players & Update Heatmaps / Distances ===
+    player_speeds = {}  # speeds in m/s
+
+    # 1) Compute shirt histogram for each detected player box this frame
+    shirt_hists = []
+    for box in player_boxes:
+        hist = get_shirt_hist(frame, box)
+        shirt_hists.append(hist)
+
+    # 2) If in "one" mode, find which box corresponds to target by histogram match
+    target_idx = None
+    if track_mode == "one":
+        if frame_index == 0:
+            for i, tid in enumerate(player_ids):
+                if tid == target_player_id:
+                    if shirt_hists[i] is not None:
+                        target_shirt_hist = shirt_hists[i].copy()
+                    target_idx = i
+                    break
+        else:
+            best_score = -1.0
+            best_i = -1
+            for i, hist in enumerate(shirt_hists):
+                if hist is None or target_shirt_hist is None:
+                    continue
+                score = cv2.compareHist(
+                    hist, target_shirt_hist, cv2.HISTCMP_CORREL)
+                if score > best_score:
+                    best_score = score
+                    best_i = i
+            if best_score > 0.4:
+                target_idx = best_i
+            else:
+                target_idx = None
+
+    # 3) Match each player box to pose index via IoU > 0.3
+    matched_pose_idx = {}
+    for i, box in enumerate(player_boxes):
+        best_iou = 0.0
+        best_j = -1
+        for j, pbox in enumerate(pose_boxes):
+            iou = compute_iou(box, pbox)
+            if iou > best_iou:
+                best_iou = iou
+                best_j = j
+        if best_iou > 0.3:
+            matched_pose_idx[i] = best_j
+
+    # 4) Build a fresh dict of “current ankle positions” for tracked players
+    current_positions = {}  # { pid: (ankle_x, ankle_y) }
+
+    # 5) Loop through players for drawing, heatmap, and ankle‐distance
+    for i, box in enumerate(player_boxes):
+        x1, y1, x2, y2 = box.astype(int)
+        feet_x = (x1 + x2) // 2
+        feet_y = y2
+
+        # Decide if we draw bounding box around this player
+        draw_box = False
+        if track_mode == "one":
+            if i == target_idx:
+                draw_box = True
+        else:  # "both"
+            if i < 2:
+                draw_box = True
+
+        if draw_box:
+            cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
+
+        # --- HEATMAP update ---
+        if track_mode == "one":
+            if i == target_idx and 0 <= feet_x < frame_width and 0 <= feet_y < frame_height:
+                heatmap_accum_1[feet_y, feet_x] += 1.0
+        else:
+            if 0 <= feet_x < frame_width and 0 <= feet_y < frame_height:
+                if i == 0:
+                    heatmap_accum_1[feet_y, feet_x] += 1.0
+                elif i == 1:
+                    heatmap_accum_2[feet_y, feet_x] += 1.0
+
+        # --- ANKLE‐BASED DISTANCE (only for the tracked player in "one", or top2 in "both") ---
+        if ((track_mode == "one" and i == target_idx) or (track_mode == "both" and i < 2)):
+
+            # Extract ankle keypoints if matched to a pose
+            ankle_x, ankle_y = None, None
+            if i in matched_pose_idx:
+                j = matched_pose_idx[i]
+                person_kp = pose_kps[j]  # shape (17, 3)
+                lx, ly, lc = person_kp[15]  # left ankle
+                rx, ry, rc = person_kp[16]  # right ankle
+
+                if lc > 0.3 and rc > 0.3:
+                    ankle_x = (lx + rx) / 2
+                    ankle_y = (ly + ry) / 2
+                elif lc > 0.3:
+                    ankle_x, ankle_y = lx, ly
+                elif rc > 0.3:
+                    ankle_x, ankle_y = rx, ry
+
+            # Fallback: box bottom‐center if ankles aren’t found
+            if ankle_x is None or ankle_y is None:
+                ankle_x = float(feet_x)
+                ankle_y = float(feet_y)
+
+            pid = player_ids[i]
+            current_positions[pid] = (ankle_x, ankle_y)
+
+            # Initialize position buffer if needed
+            if pid not in prev_positions_buffer:
+                prev_positions_buffer[pid] = deque(maxlen=BUFFER_SIZE)
+
+            # Add current position to buffer
+            prev_positions_buffer[pid].append((ankle_x, ankle_y))
+
+            if pid in prev_positions:
+                # Get smoothed previous position (average of buffer)
+                if len(prev_positions_buffer[pid]) == BUFFER_SIZE:
+                    smoothed_prev = np.mean(list(prev_positions_buffer[pid])[:-1], axis=0)
+                    smoothed_curr = np.mean(list(prev_positions_buffer[pid])[1:], axis=0)
+                    
+                    # Calculate distance using smoothed positions
+                    dist_px = np.linalg.norm(smoothed_curr - smoothed_prev)
+                    dist_m = dist_px / PIXELS_PER_METER
+
+                    # Only count reasonable movements
+                    if MIN_MOVEMENT_THRESHOLD < dist_m < MAX_MOVEMENT_THRESHOLD:
+                        total_distances[pid] = total_distances.get(pid, 0.0) + dist_m
+                        player_speeds[pid] = dist_m / frame_time
+                    else:
+                        player_speeds[pid] = 0.0
+                else:
+                    player_speeds[pid] = 0.0
+            else:
+                player_speeds[pid] = 0.0
+        else:
+            # First sighting of this pid (or it disappeared last frame)
+            total_distances[pid] = total_distances.get(pid, 0.0)
+            player_speeds[pid] = 0.0
+
+            # Draw a circle at ankle location
+            cv2.circle(annotated_frame, (int(ankle_x),
+                       int(ankle_y)), 4, (255, 0, 0), -1)
+
+    # 6) After processing all players, retain any pid from previous frame that disappeared
+    new_prev_positions = {}
+    for pid, coords in current_positions.items():
+        new_prev_positions[pid] = coords
+    for pid, coords in prev_positions.items():
+        if pid not in new_prev_positions:
+            new_prev_positions[pid] = coords
+    prev_positions = new_prev_positions
+
+    # --- Ball Detection and Tracking ---
+    ball_speed = 0.0
+    if len(ball_detections.xyxy) > 0:
+        x1, y1, x2, y2 = ball_detections.xyxy[0]
+        ball_pos = (int((x1 + x2) / 2), int((y1 + y2) / 2))
+        
+        # Calculate ball velocity and speed if we have history
+        if prev_ball_pos is not None:
+            dx = (ball_pos[0] - prev_ball_pos[0]) / frame_time
+            dy = (ball_pos[1] - prev_ball_pos[1]) / frame_time
+            velocity = (dx, dy)
+            # Calculate speed in m/s
+            ball_speed = np.linalg.norm(velocity) / PIXELS_PER_METER
+        else:
+            velocity = (0, 0)
+            ball_speed = 0.0
+            
+        # Update ball history
+        elapsed_time = (datetime.now() - start_time).total_seconds()
+        ball_history.append((frame_index, elapsed_time, ball_pos, velocity))
+        
+        # Initialize tracking variables
+        tin_hit = False
+        bounce_detected = False
+        
+        # Draw ball position and trajectory
+        cv2.circle(annotated_frame, tuple(map(int, ball_pos)), 5, (0, 255, 255), -1)
+        if prev_ball_pos is not None:
+            cv2.line(annotated_frame, 
+                     tuple(map(int, prev_ball_pos)), 
+                     tuple(map(int, ball_pos)), 
+                     (0, 255, 255), 2)
+            
+            # Check ball-wall contacts
+            for wall_name, wall_mask in wall_masks.items():
+                if check_ball_wall_contact(ball_pos, wall_mask, wall_name, frame_index, rgb_frame):
+                    print(f"Ball contact with {wall_name}")
+                    if wall_name == 'tin':
+                        tin_hit = True
+            
+            # Draw recent contacts with fade-out effect
+            for wall_name, contact_pos in list(wall_contact_history.items()):
+                time_since_contact = frame_index - wall_contact_cooldown[wall_name]
+                if time_since_contact < CONTACT_COOLDOWN:
+                    draw_wall_contact(annotated_frame, contact_pos, wall_name)
+                else:
+                    # Remove old contacts
+                    del wall_contact_history[wall_name]
+        
+        # Update bounce detection if we have history
+        if prev_ball_pos is not None:
+            bounce_detected = detect_bounce(ball_history, frame_index)
+        
+        # Update rally state
+        update_rally_state(
+            frame_count=frame_index,
+            ball_pos=ball_pos,
+            bounce_detected=bounce_detected,
+            tin_hit=tin_hit
+        )
+        
+        prev_ball_pos = ball_pos
+    else:
+        ball_speed = 0.0
+        prev_ball_pos = None
+
+    # --- Heatmap Visualization ---
+    if track_mode == "one":
+        combined_heatmap = heatmap_accum_1
+    else:
+        combined_heatmap = heatmap_accum_1 + heatmap_accum_2
+
+    heatmap_norm = cv2.normalize(
+        combined_heatmap, None, 0, 255, cv2.NORM_MINMAX)
+    heatmap_uint8 = heatmap_norm.astype(np.uint8)
+    heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_HOT)
+
+    overlay_heatmap = cv2.addWeighted(
+        annotated_frame, 0.7, heatmap_color, 0.3, 0)
+
+    # --- Display metrics in top-right corner ---
+    x_text = frame_width - 10
+    y_text = 30
+    line_height = 25
+
+    # Conversion factor: m/s → mph
+    MS_TO_MPH = 2.23694
+
+    if track_mode == "one":
+        speed_mps = player_speeds.get(target_player_id, 0.0)
+        speed_mph = speed_mps * MS_TO_MPH
+        dist_val = total_distances.get(target_player_id, 0.0)
+        ball_mph = ball_speed * MS_TO_MPH
+        
+        # Get current shot type and player color from latest shot in current rally
+        current_shot_type = "unknown"
+        current_player_color = player_colors.get(target_player_id, "unknown")
+        if current_rally and current_rally.shots:
+            current_shot_type = current_rally.shots[-1].shot_type
+            if current_rally.shots[-1].player_color:
+                current_player_color = current_rally.shots[-1].player_color
+        
+        metrics_text = [
+            f"Player ID: {target_player_id} ({current_player_color})",
+            f"Player Speed: {speed_mph:.2f} mph",
+            f"Distance Moved: {dist_val:.2f} m",
+            f"Ball Speed: {ball_mph:.2f} mph",
+            f"Shot Type: {current_shot_type}"
+        ]
+    else:
+        ball_mph = ball_speed * MS_TO_MPH
+        current_shot_type = "unknown"
+        current_player_color = "unknown"
+        if current_rally and current_rally.shots:
+            current_shot_type = current_rally.shots[-1].shot_type
+            current_player_color = current_rally.shots[-1].player_color or "unknown"
+        
+        metrics_text = [
+            f"Ball Speed: {ball_mph:.2f} mph",
+            f"Shot Type: {current_shot_type}",
+            f"Last Hit By: {current_player_color}"
+        ]
+        
+        for i, pid in enumerate(player_ids[:2]):
+            speed_mps = player_speeds.get(pid, 0.0)
+            speed_mph = speed_mps * MS_TO_MPH
+            dist_val = total_distances.get(pid, 0.0)
+            player_color = player_colors.get(pid, "unknown")
+            metrics_text.append(f"Player {pid} ({player_color}) Speed: {speed_mph:.2f} mph")
+            metrics_text.append(f"Player {pid} Dist: {dist_val:.2f} m")
+
+    for i, line in enumerate(metrics_text):
+        text_size, _ = cv2.getTextSize(line, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        text_w, _ = text_size
+        cv2.putText(
+            overlay_heatmap,
+            line,
+            (x_text - text_w, y_text + i * line_height),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA
+        )
+
+    # --- Draw Pose Keypoints (for matched players only) ---
+    if hasattr(pose_results, "keypoints") and pose_results.keypoints is not None:
+        for i, pid in enumerate(player_ids):
+            if (track_mode == "one" and i != target_idx) or (track_mode == "both" and i not in [0, 1]):
+                continue
+            if i not in matched_pose_idx:
+                continue
+            j = matched_pose_idx[i]
+            person_kp = pose_kps[j]
+            for keypoint in person_kp:
+                x, y, conf = keypoint
+                if conf > 0.5:
+                    cv2.circle(overlay_heatmap, (int(x), int(y)),
+                               5, (0, 255, 0), -1)
+
+    # --- Display and write frame ---
+    cv2.imshow('Real-time Tracking', overlay_heatmap)
+    out.write(overlay_heatmap)
+    frame_index += 1
+    
+    # Break handled in JSON export section above
+    
+    frame_count += 1
+
+    # Only export rally data at the end
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        # Export rally data to JSON
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_data = {
+            'start_time': start_time.isoformat(),
+            'video_file': input_video,
+            'rallies': [{
+                'start_frame': r.start_frame,
+                'end_frame': r.end_frame,
+                'start_time': (start_time + timedelta(seconds=r.start_time)).isoformat(),
+                'end_time': (start_time + timedelta(seconds=r.end_time)).isoformat() if r.end_time else None,
+                'shots': [{
+                    **asdict(s),
+                    'timestamp': (start_time + timedelta(seconds=s.timestamp)).isoformat()
+                } for s in r.shots],
+                'winner_id': r.winner_id,
+                'end_reason': r.end_reason
+            } for r in rally_history]
+        }
+
+        with open('match_data.json', 'w') as f:
+            json.dump(output_data, f, indent=2)
+
+        print(f"\nExported {len(rally_history)} rallies to match_data.json")
+        break
+
+
+if track_mode == "one":
+    save_heatmap(heatmap_accum_1, "heatmap_player.png")
+    print("Heatmap image saved as heatmap_player.png")
+else:
+    save_heatmap(heatmap_accum_1, "heatmap_player1.png")
+    save_heatmap(heatmap_accum_2, "heatmap_player2.png")
+    print("Heatmap images saved as heatmap_player1.png and heatmap_player2.png")
+
+# Save the last frame with heatmap and metrics
+cv2.imwrite("last_frame.png", overlay_heatmap)
+print("Last frame saved as last_frame.png")
+
+# === Cleanup ===
+cap.release()
+out.release()
+cv2.destroyAllWindows()
+print(f"Processing complete. Output saved as {output_video}")
