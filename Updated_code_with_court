@@ -435,20 +435,26 @@ def classify_shot(ball_history, wall_contacts, fh, fw, is_first_shot=False):
 def determine_rally_winner(rally: RallyEvent) -> Optional[int]:
     """
     Determine the rally winner based on the last shot and end_reason.
+    The last player who hit the ball wins unless they hit the tin or the ball went out.
     """
     if not rally.shots:
         return None
+    
     last_shot = rally.shots[-1]
     last_pid = last_shot.player_id
+    
     if rally.end_reason == 'tin':
+        # If the last player hit the tin, the other player wins
         for s in reversed(rally.shots[:-1]):
             if s.player_id != last_pid:
                 return s.player_id
         return None
     elif rally.end_reason == 'double_bounce':
+        # If double bounce, the last player wins
         return last_pid
     else:
-        return None
+        # For any other reason (like out of bounds), the last player wins
+        return last_pid
 
 # -------------------------------
 # New function: Check if ball is near wrist
