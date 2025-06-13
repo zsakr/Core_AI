@@ -328,28 +328,104 @@ def get_closest_player(frame, ball_pos, player_boxes, player_ids, frame_width):
     return None, None, None
 
 
-def detect_bounce(ball_history, frame_idx, min_points=5):
+def is_ball_near_floor(ball_pos, floor_mask, threshold=20):
     """
-    Detect a bounce if recent vertical velocities change from negative to positive.
+    Check if the ball is near the floor using the court detection mask.
+    Returns True if the ball is within threshold pixels of the floor.
+    """
+    x, y = map(int, ball_pos)
+    if not (0 <= y < floor_mask.shape[0] and 0 <= x < floor_mask.shape[1]):
+        return False
+    
+    # Check if ball is directly on floor
+    if floor_mask[y, x] > 0:
+        return True
+    
+    # Check surrounding area for floor
+    for dy in range(-threshold, threshold + 1):
+        for dx in range(-threshold, threshold + 1):
+            check_y = y + dy
+            check_x = x + dx
+            if (0 <= check_y < floor_mask.shape[0] and 
+                0 <= check_x < floor_mask.shape[1] and 
+                floor_mask[check_y, check_x] > 0):
+                # Calculate distance to floor
+                distance = np.sqrt(dx*dx + dy*dy)
+                if distance <= threshold:
+                    return True
+    return False
+
+
+def detect_bounce(ball_history, frame_idx, floor_mask, min_points=5):
+    """
+    Enhanced bounce detection using multiple criteria:
+    1. Vertical velocity change (direction and magnitude)
+    2. Ball trajectory analysis
+    3. Acceleration patterns
     """
     if len(ball_history) < min_points:
         return False
-    recent_vy = [p[3][1] for p in ball_history[-min_points:]]
-    for i in range(1, len(recent_vy)):
-        if recent_vy[i-1] < 0 and recent_vy[i] > 0:
-            return True
-    return False
-
+    
+    # Get recent ball positions and velocities
+    recent_positions = [p[2] for p in ball_history[-min_points:]]
+    recent_velocities = [p[3] for p in ball_history[-min_points:]]
+    
+    # Calculate vertical velocity changes and accelerations
+    vy_changes = []
+    accelerations = []
+    for i in range(1, len(recent_velocities)):
+        vy_changes.append(recent_velocities[i][1] - recent_velocities[i-1][1])
+        if i > 1:
+            acc = (recent_velocities[i][1] - recent_velocities[i-1][1]) - (recent_velocities[i-1][1] - recent_velocities[i-2][1])
+            accelerations.append(acc)
+    
+    # Check for significant upward velocity change
+    significant_vy_change = False
+    for i in range(1, len(recent_velocities)):
+        if recent_velocities[i-1][1] < 0 and recent_velocities[i][1] > 0:  # Direction change
+            if abs(recent_velocities[i][1]) > 3.0:  # Minimum upward velocity
+                significant_vy_change = True
+                break
+    
+    # Enhanced bounce pattern detection
+    clear_bounce_pattern = False
+    if len(recent_positions) >= 3:
+        # Check for V-shaped pattern in y-coordinates
+        mid_idx = len(recent_positions) // 2
+        if (recent_positions[mid_idx][1] < recent_positions[mid_idx-1][1] and 
+            recent_positions[mid_idx][1] < recent_positions[mid_idx+1][1]):
+            clear_bounce_pattern = True
+    
+    # Check for sudden acceleration (impact)
+    sudden_acceleration = any(abs(acc) > 10.0 for acc in accelerations) if accelerations else False
+    
+    # Debug prints
+    print(f"Bounce Detection at frame {frame_idx}:")
+    print(f"  Significant VY change: {significant_vy_change}")
+    print(f"  Clear bounce pattern: {clear_bounce_pattern}")
+    print(f"  Sudden acceleration: {sudden_acceleration}")
+    
+    # Return true if we have strong evidence of a bounce
+    return significant_vy_change or (clear_bounce_pattern and sudden_acceleration)
+ 
 
 def create_mask_from_points(points, shape):
     """
     Create a binary mask from polygon points.
     """
-    pts = np.array([(p.x, p.y) for p in points], dtype=np.int32)
-    mask = np.zeros(shape[:2], dtype=np.uint8)
-    cv2.fillPoly(mask, [pts], 1)
-    return mask
+    if not points:
+        return np.zeros(shape[:2], dtype=np.uint8)
 
+    pts = np.array([(int(p.x), int(p.y)) for p in points], dtype=np.int32)
+    mask = np.zeros(shape[:2], dtype=np.uint8)
+    cv2.fillPoly(mask, [pts], 255)
+    
+    # Debug prints
+    print(f"Floor prediction points: {len(points)}")
+    for p in points[:5]:
+        print(f"({p.x:.1f}, {p.y:.1f})")
+    
+    return mask
 
 def classify_shot(ball_history, wall_contacts, fh, fw, is_first_shot=False):
     """
@@ -435,26 +511,20 @@ def classify_shot(ball_history, wall_contacts, fh, fw, is_first_shot=False):
 def determine_rally_winner(rally: RallyEvent) -> Optional[int]:
     """
     Determine the rally winner based on the last shot and end_reason.
-    The last player who hit the ball wins unless they hit the tin or the ball went out.
     """
     if not rally.shots:
         return None
-    
     last_shot = rally.shots[-1]
     last_pid = last_shot.player_id
-    
     if rally.end_reason == 'tin':
-        # If the last player hit the tin, the other player wins
         for s in reversed(rally.shots[:-1]):
             if s.player_id != last_pid:
                 return s.player_id
         return None
     elif rally.end_reason == 'double_bounce':
-        # If double bounce, the last player wins
         return last_pid
     else:
-        # For any other reason (like out of bounds), the last player wins
-        return last_pid
+        return None
 
 # -------------------------------
 # New function: Check if ball is near wrist
@@ -552,6 +622,58 @@ def draw_court_area(frame, x1, y1, x2, y2, label, conf, color):
     cv2.putText(frame, text, (text_x, text_y), font, font_scale, (255, 255, 255), thickness)
 
 
+def draw_bounce_effect(frame, position, frame_count, contact_frame, wall_name):
+    """
+    Draw a fading circle effect at the bounce position.
+    """
+    x, y = map(int, position)
+    frames_since_contact = frame_count - contact_frame
+    
+    if frames_since_contact < int(fps * 3):  # Show effect for 3 seconds
+        # Calculate circle properties based on time
+        alpha = 1.0 - (frames_since_contact / (fps * 3))  # Fade out over 3 seconds
+        radius = 15 - (frames_since_contact // 2)  # Start at 15 pixels and shrink over time
+        
+        # Draw outer circle (white border)
+        cv2.circle(frame, (x, y), radius + 1, (255, 255, 255), 1)
+        
+        # Draw inner circle (semi-transparent yellow)
+        overlay = frame.copy()
+        cv2.circle(overlay, (x, y), radius, (0, 255, 255), -1)  # Yellow (BGR: 0, 255, 255)
+        cv2.addWeighted(overlay, alpha * 0.6, frame, 1 - alpha * 0.6, 0, frame)  # Increased opacity to 0.6
+        
+        # Debug print for visualization
+        if frames_since_contact == 0:
+            print(f"Drawing bounce effect for {wall_name} at ({x}, {y})")
+
+
+def draw_shot_type(frame, position, shot_type, frame_count, contact_frame):
+    """
+    Draw the shot type label near the wall contact point with smooth font and no background.
+    """
+    x, y = map(int, position)
+    frames_since_contact = frame_count - contact_frame
+    
+    if frames_since_contact < 30:  # Show label for 30 frames
+        # Calculate alpha for fade out
+        alpha = 1.0 - (frames_since_contact / 30.0)
+        
+        # Format shot type text
+        text = shot_type.replace('_', ' ').title()
+        
+        # Use a smoother font with anti-aliasing
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.7  # Slightly larger font
+        thickness = 2    # Thicker for better visibility without background
+        
+        # Position text above the contact point
+        text_x = x
+        text_y = y - 25  # 25 pixels above the contact point
+        
+        # Draw text with anti-aliasing
+        cv2.putText(frame, text, (text_x, text_y), font, font_scale, (0, 255, 255), thickness, cv2.LINE_AA)
+        print(f"Drawing shot type: {text} at position ({x}, {y})")
+
 def check_ball_wall_contact(ball_pos, wall_mask, wall_name, frame_count, frame):
     """
     Check if the ball has contacted a wall. If so, classify a shot
@@ -567,6 +689,9 @@ def check_ball_wall_contact(ball_pos, wall_mask, wall_name, frame_count, frame):
         if wall_mask[y, x] > 0:
             wall_contact_history[wall_name] = ball_pos
             wall_contact_cooldown[wall_name] = frame_count
+            
+            # Draw bounce effect immediately
+            draw_bounce_effect(frame, ball_pos, frame_count, frame_count, wall_name)
 
             if current_rally is not None:
                 closest_player_id = None
@@ -611,7 +736,8 @@ def check_ball_wall_contact(ball_pos, wall_mask, wall_name, frame_count, frame):
                 current_rally.shots.append(current_shot)
 
                 if shot_type != "unknown":
-                    drawn_labels.append((frame_count, shot_type, ball_pos))
+                    # Draw shot type near the wall contact
+                    draw_shot_type(frame, ball_pos, shot_type, frame_count, frame_count)
             return True
     return False
 
@@ -624,20 +750,29 @@ def update_pixels_per_meter(frame, annotated_frame=None):
     global PIXELS_PER_METER
     court_results = court_model.infer(frame)[0]
     if not hasattr(court_results, 'predictions') or len(court_results.predictions) == 0:
+        print("No court predictions found")
         return False
+
+    print("\nCourt Detection Details:")
+    for pred in court_results.predictions:
+        print(f"Found {pred.class_name} with confidence {pred.confidence:.2f}")
 
     floor_pred = None
     for pred in court_results.predictions:
         if pred.class_name == 'floor':
             floor_pred = pred
+            print(f"Found floor with confidence {pred.confidence:.2f}")
             break
+
     if floor_pred is None:
+        print("No floor detection found")
         return False
 
     floor_mask = create_mask_from_points(floor_pred.points, frame.shape)
     x_coords = np.where(np.any(floor_mask, axis=0))[0]
     y_coords = np.where(np.any(floor_mask, axis=1))[0]
     if len(x_coords) == 0 or len(y_coords) == 0:
+        print("Invalid floor mask coordinates")
         return False
 
     court_width_px = x_coords[-1] - x_coords[0]
@@ -645,6 +780,7 @@ def update_pixels_per_meter(frame, annotated_frame=None):
     ppm_w = court_width_px / COURT_WIDTH_M
     ppm_h = court_height_px / COURT_LENGTH_M
     PIXELS_PER_METER = (ppm_w + ppm_h) / 2
+    print(f"Updated PIXELS_PER_METER to {PIXELS_PER_METER:.2f}")
 
     if annotated_frame is not None:
         colors = {
@@ -726,14 +862,22 @@ try:
         court_results = court_model.infer(rgb_frame)[0]
         wall_masks = {}
         if hasattr(court_results, 'predictions') and len(court_results.predictions) > 0:
+            print("\nCourt Detection Results:")
             for pred in court_results.predictions:
-                if pred.class_name in ['front-wall-up', 'front-wall-down', 'left-wall', 'right-wall', 'tin']:
+                print(f"Detected: {pred.class_name} with confidence {pred.confidence:.2f}")
+                if pred.class_name in ['front-wall-up', 'front-wall-down', 'left-wall', 'right-wall', 'tin', 'floor']:
                     wall_masks[pred.class_name] = create_mask_from_points(pred.points, rgb_frame.shape)
+                    print(f"Added {pred.class_name} to wall_masks")
+            
+            # Debug print available masks
+            print("\nAvailable wall masks:", list(wall_masks.keys()))
 
         # Periodically update pixels-per-meter and redraw court
         if frame_index % 30 == 0:
             if not update_pixels_per_meter(rgb_frame, annotated_frame):
                 print("Warning: Could not detect court in frame")
+            else:
+                print("Successfully updated court detection")
 
         # --- Ball Detection ---
         ball_results = ball_model.infer(rgb_frame)[0]
@@ -854,16 +998,6 @@ try:
             feet_x = (x1 + x2) // 2
             feet_y = y2
 
-            draw_box = False
-            if track_mode == "one":
-                if i == target_idx:
-                    draw_box = True
-            else:  # both
-                if i < 2:
-                    draw_box = True
-            if draw_box:
-                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (255, 0, 0), 2)
-
             # Heatmap update
             if track_mode == "one":
                 if i == target_idx and 0 <= feet_x < frame_width and 0 <= feet_y < frame_height:
@@ -945,32 +1079,40 @@ try:
             cv2.circle(annotated_frame, tuple(map(int, ball_pos)), 5, (0, 255, 255), -1)
             if prev_ball_pos is not None:
                 cv2.line(annotated_frame, tuple(map(int, prev_ball_pos)), tuple(map(int, ball_pos)), (0, 255, 255), 2)
+                
+                # Check floor contact first if floor mask exists
+                floor_mask = wall_masks.get('floor')
+                if floor_mask is not None:
+                    bounce_detected = detect_bounce(ball_history, frame_index, floor_mask)
+                    if bounce_detected:
+                        print(f"Floor contact detected at frame {frame_index}")
+                else:
+                    print("Floor mask not available for bounce detection")
+
+                # Then check other wall contacts
                 for wname, wmask in wall_masks.items():
-                    if check_ball_wall_contact(ball_pos, wmask, wname, frame_index, rgb_frame):
-                        print(f"Ball contact with {wname}")
-                        if wname == 'tin':
-                            tin_contact_frames += 1
-                            if tin_contact_frames >= MIN_TIN_CONTACT_FRAMES:
-                                tin_hit = True
-                                print(f"Tin hit confirmed at frame {frame_index} after {tin_contact_frames} frames of contact")
-                        else:
-                            tin_contact_frames = 0  # Reset tin contact counter if ball hits other wall
+                    if wname != 'floor':  # Skip floor as we already checked it
+                        if check_ball_wall_contact(ball_pos, wmask, wname, frame_index, annotated_frame):
+                            print(f"Wall contact detected at frame {frame_index}")
+                            if wname == 'tin':
+                                tin_contact_frames += 1
+                                if tin_contact_frames >= MIN_TIN_CONTACT_FRAMES:
+                                    tin_hit = True
+                                    print(f"Tin hit confirmed at frame {frame_index} after {tin_contact_frames} frames of contact")
+                            else:
+                                tin_contact_frames = 0  # Reset tin contact counter if ball hits other wall
                     else:
                         if wname == 'tin':
                             tin_contact_frames = 0  # Reset tin contact counter if ball is not touching tin
 
+                # Draw shot type for recent wall contacts
                 for wname, pos in list(wall_contact_history.items()):
                     since = frame_index - wall_contact_cooldown[wname]
                     if since < CONTACT_COOLDOWN:
-                        x, y = map(int, pos)
-                        color_map = {
-                            'front-wall-up': (255, 0, 255),
-                            'front-wall-down': (0, 255, 255),
-                            'left-wall': (255, 0, 0),
-                            'right-wall': (0, 0, 255),
-                            'tin': (128, 128, 0)
-                        }
-                        cv2.circle(annotated_frame, (x, y), 20 - 2*since, color_map.get(wname, (0, 255, 0)), 2)
+                        draw_bounce_effect(annotated_frame, pos, frame_index, wall_contact_cooldown[wname], wname)
+                        # Also draw shot type if we have a current shot
+                        if current_shot and current_shot.shot_type != "unknown":
+                            draw_shot_type(annotated_frame, pos, current_shot.shot_type, frame_index, wall_contact_cooldown[wname])
                     else:
                         del wall_contact_history[wname]
 
@@ -997,8 +1139,6 @@ try:
                     if dist_rw < min_wrist_dist:
                         wrist_pos_to_use = (rw_x, rw_y)
                         min_wrist_dist = dist_rw
-
-            bounce_detected = detect_bounce(ball_history, frame_index)
 
             update_rally_state(
                 frame_count=frame_index,
@@ -1157,4 +1297,3 @@ finally:
     out.release()
     cv2.destroyAllWindows()
     print(f"Processing complete. Output saved as {output_video}")
-
